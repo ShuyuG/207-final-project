@@ -1,0 +1,1124 @@
+---
+title: "Factors Most Explanatory for Case Rate Increasing"
+
+author: "Shuyu Guo, 920250529"
+date: "March 4th, 2022"
+output:
+  html_document:
+    df_print: paged
+    number_sections: yes
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+    code_folding: show
+    
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(fig.pos = 'H')
+```
+
+```{r include=FALSE}
+library(readr)
+library(dplyr)
+library(readxl)
+library(MASS)
+library(olsrr)
+library(car)
+library(lmtest)
+library(ggplot2)
+library(lme4)
+library(lmerTest)
+library(broom)
+library(ggpubr)
+library(gridExtra)
+library(reshape2)
+library(glmnet)
+library(naniar)
+library(flextable)
+library(gtsummary)
+```
+
+
+
+```{r eval=FALSE, include=FALSE}
+############# data merge #########
+
+
+owid_covid_data = read_csv("D:/ucdavis/STA 207/Final Project/Final/dataset/data source/owid-covid-data_.csv")
+select_covid_data = owid_covid_data[,c(3,4,41,42,43,49,50,51,52,53,54,56,60,61,62)]
+names(select_covid_data) = c("country","date","total_vaccinations_per_hundred","people_vaccinated_per_hundred","people_fully_vaccinated_per_hundred","population","population_density","median_age",	"aged_65_older","aged_70_older",	"gdp_per_capita",	"cardiovasc_death_rate","handwashing_facilities",	"hospital_beds_per_thousand","life_expectancy"
+)
+select_covid_data$date = as.character(strftime(select_covid_data$date,format='%Y%m%d'))
+
+covid_cum_data = read_csv("D:/ucdavis/STA 207/Final Project/Final/dataset/data source/WHO-COVID-19-global-table-data.csv")
+covid_cum_data = covid_cum_data[,c(1,4,9)]
+names(covid_cum_data) = c("country","current_cases_per_100000","current_deaths_per_100000")
+
+covid_detail_data = read_csv("D:/ucdavis/STA 207/Final Project/Final/dataset/data source/WHO-COVID-19-global-data.csv")
+covid_detail_data = covid_detail_data[,c(1,3,4,6)]
+names(covid_detail_data) = c("date","country","region","cumulative_cases_by_date")
+covid_detail_data$date = as.character(strftime(covid_detail_data$date,format='%Y%m%d'))
+
+vaccine_WHO = read_csv("D:/ucdavis/STA 207/Final Project/Final/dataset/data source/vaccination-data.csv")
+vaccine_WHO = vaccine_WHO[,c(1,8,9,11,13,14)]
+names(vaccine_WHO) = c("country","cum_total_vaccinations_per","cum_people_vaccinated_per","cum_fully_people_vaccinated_per","first_vac_date","vac_type_number")
+vaccine_WHO$first_vac_date = as.character(strftime(vaccine_WHO$first_vac_date,format='%Y%m%d'))
+
+income_worldbank = read_excel("D:/ucdavis/STA 207/Final Project/Final/dataset/data source/income.xlsx")
+
+merge1 = merge(covid_detail_data,covid_cum_data,by = "country",all.x = T)
+merge_null = merge1[is.na(merge1$current_cases_per_100000)==T,]
+merge1 = merge1[merge1$country!="Other",]
+
+
+
+### get monthly averaged vaccine rate
+
+
+timepoint = c("2020/1/10", "2020/2/10", "2020/3/10","2020/4/10", "2020/5/10","2020/6/10","2020/7/10", "2020/8/10", "2020/9/10", "2020/10/10", "2020/11/10", "2020/12/10", "2021/1/10", "2021/2/10", "2021/3/10", "2021/4/10", "2021/5/10", "2021/6/10", "2021/7/10", "2021/8/10", "2021/9/10", "2021/10/10", "2021/11/10", "2021/12/10", "2022/1/10")
+timepoint = as.character(strftime(timepoint,format='%Y%m%d'))
+
+
+get_monthly_avg_vac_rate= function(loc,covid_data){
+  local = covid_data[covid_data$country==loc,]
+  localdata = rep(0,dim(covid_data)[2]+3)
+  index = sum(timepoint<local$date[1])+1
+  for (i in index:(length(timepoint)-1)) {
+    subdata = local[which(local$date>timepoint[i] & local$date<=timepoint[i+1]),]
+    subdata$monthly_total_vaccinations_per = mean(subdata$total_vaccinations_per_hundred,na.rm = T)
+    subdata$monthly_people_vaccinated_per = mean(subdata$people_vaccinated_per_hundred,na.rm = T)
+    subdata$monthly_fully_people_vaccinated_per = mean(subdata$people_fully_vaccinated_per_hundred,na.rm = T)
+    localdata = rbind(localdata,subdata)
+  }
+  localdata = localdata[-1,]
+  rownames(localdata) = 1:nrow(localdata)
+  
+  local_vac = localdata[localdata$date %in% timepoint,]
+  local_vac = local_vac[,-c(3,4,5)]
+  return(local_vac) 
+}
+
+
+country = unique(select_covid_data$country)
+worldwide_month_vac_data = rep(0,15)
+for (loc in country) {
+  local_vac = get_monthly_avg_vac_rate(loc,select_covid_data)
+  worldwide_month_vac_data = rbind(worldwide_month_vac_data, local_vac)
+}
+
+worldwide_month_vac_data = worldwide_month_vac_data[-1,]
+rownames(worldwide_month_vac_data) = 1:nrow(worldwide_month_vac_data)
+
+
+
+
+#### get monthly increased case rate
+
+get_monthly_cases = function(loc,covid_data){
+  local = covid_data[covid_data$country==loc,]
+  local_monthly_case = local[local$date %in% timepoint,]
+  
+  n = nrow(local_monthly_case)
+  if(n>1){
+    for (row in nrow(local_monthly_case):2) {
+      local_monthly_case$monthly_new_case_number[row] = local_monthly_case$cumulative_cases_by_date[row]-local_monthly_case$cumulative_cases_by_date[row-1]
+    }
+    local_monthly_case = local_monthly_case[-1,]
+    rownames(local_monthly_case) = 1:nrow(local_monthly_case)
+    return(local_monthly_case) 
+  } else{
+    local_monthly_case$monthly_new_case_number[1] = "null"
+    return(local_monthly_case) 
+  }
+}
+
+country = unique(merge1$country)
+worldwide_monthly_newcase = rep(0,dim(merge1)[2])
+for (loc in country) {
+  local_covid = get_monthly_cases(loc,merge1)
+  worldwide_monthly_newcase = rbind(worldwide_monthly_newcase, local_covid)
+}
+
+worldwide_monthly_newcase = worldwide_monthly_newcase[-1,]
+worldwide_monthly_newcase = worldwide_monthly_newcase[worldwide_monthly_newcase$monthly_new_case_number!="null",]
+rownames(worldwide_monthly_newcase) = 1:nrow(worldwide_monthly_newcase)
+
+
+
+
+#### check country
+country_pop = unique(worldwide_month_vac_data[,c(1,3)])
+merge_country = merge(worldwide_monthly_newcase,country_pop,by = "country",all.x = T)
+# country_null = merge_country[is.na(merge_country$population)==T,]
+# unique(country_null$country)
+
+
+
+### modify country of owid data
+original_country_list = c("Bolivia","Brunei","Cape Verde","Cote d'Ivoire","Curacao","Democratic Republic of Congo","Faeroe Islands","Falkland Islands","Iran","Kosovo","Laos","Micronesia (country)","Moldova","Palestine","Pitcairn","Sint Maarten (Dutch part)","South Korea","Syria","Tanzania","Timor","United Kingdom","United States","Venezuela","Vietnam")
+modify_country_list = c("Bolivia (Plurinational State of)","Brunei Darussalam","Cabo Verde","Côte d’Ivoire","Curaçao","Democratic Republic of the Congo","Faroe Islands","Falkland Islands (Malvinas)","Iran (Islamic Republic of)","Kosovo[1]","Lao People's Democratic Republic","Micronesia (Federated States of)","Republic of Moldova","occupied Palestinian territory, including east Jerusalem","Pitcairn Islands","Sint Maarten","Republic of Korea","Syrian Arab Republic","United Republic of Tanzania","Timor-Leste","The United Kingdom","United States of America","Venezuela (Bolivarian Republic of)","Viet Nam")
+
+for (i in 1:length(original_country_list)) {
+  worldwide_month_vac_data[worldwide_month_vac_data$country==original_country_list[i],]$country = modify_country_list[i]
+}
+
+
+
+merge_feature_data = merge(worldwide_monthly_newcase,unique(worldwide_month_vac_data[,c(1,3,4,5,6,7,8,9,10,11,12)]),by = "country",all.x = T)
+merge_vaccine_covid = merge(merge_feature_data,worldwide_month_vac_data[,c(1,2,13,14,15)],by = c("country","date"),all.x = T)
+merge_vaccine_covid = merge_vaccine_covid[is.na(merge_vaccine_covid$population)==F,]
+merge_vaccine_covid$monthly_new_case_per_100000 = merge_vaccine_covid$monthly_new_case_number/merge_vaccine_covid$population*100000
+
+
+
+
+### merge first vaccine date
+vaccine_WHO[vaccine_WHO$country=="occupied Palestinian territory",]$country ="occupied Palestinian territory, including east Jerusalem"
+merge_first_vac_date = merge(merge_vaccine_covid,vaccine_WHO,by = "country",all.x = T)
+null_date = merge_first_vac_date[is.na(merge_first_vac_date$first_vac_date)==T,]
+unique(null_date$country)
+
+merge_first_vac_date = merge_first_vac_date[order(merge_first_vac_date$country, merge_first_vac_date$date),]
+
+
+
+
+### set NA of vaccine rate before the first vaccine date to 0
+for (i in 1:dim(merge_first_vac_date)[1]) {
+  if(is.na(merge_first_vac_date[i,]$first_vac_date)==FALSE){
+    if(merge_first_vac_date[i,]$date < merge_first_vac_date[i,]$first_vac_date){
+      merge_first_vac_date[i,]$monthly_total_vaccinations_per=0
+      merge_first_vac_date[i,]$monthly_people_vaccinated_per=0
+      merge_first_vac_date[i,]$monthly_fully_people_vaccinated_per=0
+    }
+  }
+}
+
+### combine the income data
+merge_income = merge(merge_first_vac_date,income_worldbank,by = "country",all.x = T)
+merge_income = merge_income[is.na(merge_income$income)==FALSE,]
+merge_income[merge_income$country=="Côte d’Ivoire",]$country="Cote d'Ivoire"
+#write.csv(merge_income,file="merge_income.csv")
+
+```
+
+
+```{r include=FALSE}
+merge_income_ = read_csv("D:/ucdavis/STA 207/Final Project/Final/dataset/merge data/merge_income.csv")
+merge_income_ = merge_income_[,-1]
+merge_income_$date = as.character(merge_income_$date)
+#View(merge_income_)
+```
+
+
+# Introduction
+
+Since the start of 2020, the pandemic of Covid-19 has dramatically changed life of people in the whole world. Lots of efforts have been put into controlling spread of coronavirus, like keeping social distance, wearing masks, increasing sanitizing facilities, injecting vaccines and so on. The main goal in this project is to detect factors that are associated with case rate increasing and how these factors take effect on case rate. 
+
+We downloaded the covid-19 global table data file[1] and covid-19 global data file[2] from WHO coronavirus dashboard. The most up-to-date cumulative case rate and case fatality rate are extracted from the former file. And the case rate changing over time can be obtained from the latter file. In this report, we calculated monthly increased case rate and set it as our response. From the Github of Our World in Data, we downloaded the owid_covid_data file[3] which contains daily reported cumulative vaccination rate as well as the country level features which are possibly associated with covid infection. For this report, we extracted population density, median age, aged 65 older rate, aged 70 older rate, gdp per capita, cardiovasc death rate, handwashing facility rate, hospital beds rate, life expectancy and monthly fully vaccinated rate. With the country income level classification[4] according to GNI per capita provided by The World Bank and geographic region of country, we have 12 potential variables in total. Among these variables, we will detect the factors most explanatory for the monthly increased case rate. 
+
+Based on the factors found to be significantly associated with case rate increasing, we can give suggestions for the governments and public to better prevent the spread of coronavirus. For instance, if the handwashing facility rate is found to be negatively associated with case rate, then we can give suggestion that the infection can be better controlled if the number of handwashing facilities in public area can be increased or people can improve their habit of cleaning and disinfection.
+
+# Background
+
+There have been numerous researches conducted on the spreading and mortality of coronavirus. Some paper has found that the economic inequality would enhance the risk of infection and the urban population is positively associated with the case rate[5]. Also, it is suggested by a weekly report that covid-19 vaccination can provide immunity and protection against subsequent SARS-CoV-2 infection and illness[6]. Thus the key variables we select are reasonable and we can possibly find factors associated with covid-19 case rate.  
+
+To find possible factors that would affect the case rate, an intuitive idea is to examine the association between cumulative case rate of the entire pandemic period and possible factors. That is, each country is taken as an individual observation with the cumulative case rate by Feb.23 as response, and other country-level features as well as the latest reported cumulative vaccination rate are taken as the explanatory factors. However, we should notice that the covid-19 cases were first reported both in China and Finland on Jan.4th of 2020, while the first dose of vaccine was taken in China on Jul.22th of 2020 and most countries started using vaccine after January of 2021. Thus, if we analyze with the strategy above, the effect of vaccination on case rate might be masked due to the lack of vaccine use during 2020 for most countries. 
+
+Therefore, we calculated the new reported case rate, cumulative vaccinated rate and cumulative fully vaccinated rate for each month, where the earliest month is set from 2020 Jan.10 to 2020 Feb.10 and the latest month is set from 2021 Dec.10 to 2022 Jan.10. For each country, the monthly new reported case rate is calculated by subtracting the cumulative case rate on 10th of previous month from the cumulative case rate on 10th of current month. Also, the monthly vaccination rates are calculated by taking average for the corresponding period. For the months before the first vaccine date, the vaccination rate is set as 0. Initially, we obtained 4847 observations for 202 countries in total. For some countries, the vaccination rates are not reported for some months after the first vaccine date, so there are some missing values for vaccination variables. 
+
+```{r include=FALSE}
+visdata1 = merge_income_
+visdata1 = arrange(visdata1,visdata1[,1],visdata1[,2])
+visdata1 = visdata1[visdata1$monthly_new_case_per_100000>=0,]
+visdata1 = visdata1[visdata1$country!="Gibraltar",]
+dim(visdata1)
+```
+
+```{r include=FALSE}
+section = unique(visdata1[,c(1,3,5,6,9,10,11,12,13,14,15,16,17,24,25,27)])
+section = section[is.na(section$region)==F,]
+section = section[section$country!="Gibraltar",]
+dim(section)
+```
+
+
+
+
+# Descriptive data analysis
+
+In this section, we use both cumulative data of the entire period and month-level data to conduct descriptive data analysis for covid cases, vaccination and case fatality rate across geographical location, economy level, time, etc.
+
+## Summary statistics
+
+Firstly, with the table below, we can briefly have a glance at the properties of the country level explanatory variables. We can see that these variables varies quite a lot across the whole world.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+sec = section[,c(3:15)]
+sec$current_deaths_per_100000 = sec$current_deaths_per_100000/sec$current_cases_per_100000
+colnames(sec) = c("cum cases per 100000","cum case fatality rate","population density","median age","65 older ratio","70 older ratio","gdp per capita","cardiovasc death rate","handwash facilities","hospital beds per thousand","life expectancy","cumulative fully vaccinated","first vaccine date")
+
+mean_1 = (round(apply(sec[,c(1:13)],2,mean,na.rm = T),digits = 2))
+sd_1 = (round(apply(sec[,c(1:13)],2,sd,na.rm = T),digits = 2))
+quartile_1 = t(data.frame(quartile = round(apply(sec[,c(1:13)],2,quantile,na.rm = T),digits = 2)))
+n_missing = data.frame(miss_var_summary(sec[,c(1:13)],order = FALSE))[,c(1,2)]
+table_1 = cbind(n_missing,mean_1,sd_1,quartile_1)
+colnames(table_1) = c("name","n_missing","mean","sd","min","25%","50%","75%","max")
+
+
+month_case = c("monthly new case per 100000",sum(is.na(visdata1$monthly_new_case_per_100000)),round(c(mean(visdata1$monthly_new_case_per_100000),sd(visdata1$monthly_new_case_per_100000),summary(visdata1$monthly_new_case_per_100000)),2))
+month_case = month_case[-8]
+
+month_vac = c("monthly fully vac rate",sum(is.na(visdata1$monthly_fully_people_vaccinated_per)),round(c(mean(visdata1$monthly_fully_people_vaccinated_per,na.rm=T),sd(visdata1$monthly_fully_people_vaccinated_per,na.rm=T),summary(visdata1$monthly_fully_people_vaccinated_per)[-7]),2))
+month_vac = month_vac[-c(8)]
+
+
+table_2 = rbind(table_1,month_case)
+table_2 = rbind(table_2,month_vac)
+
+
+country_features = table_2[c(3:11),]
+country_features = flextable(country_features)
+country_features = width(country_features, j = NULL, 6, unit = "in")
+country_features = fontsize(country_features, i = NULL, j = NULL, size = 9, part = "body")
+autofit(country_features, add_w = 0.1, add_h = 0.1, part = c("body", "header"), unit = "in")
+
+
+```
+
+ - Some variables are not collected for amount of countries. Specifically, handwashing facility rate is missing for more than half of the 202 countries, while hospital beds rate is missing for 33 out of 202 countries.
+ 
+ - The age variables(median age, 65 older ratio, 70 older ratio), gdp per capita, cardiovasc death rate and hospital beds rate have a right skewed distribution.
+ 
+ - The life expectancy have a left skewed distribution, while the handwashing facility rate have a more uniform distribution than other variables.
+ 
+
+
+
+The table below summarizes the covid case, mortality and vaccination status. The "cumulative" means up to Feb.23th of 2022. And here the statistics for monthly new case rate and monthly fully vaccinated rate are calculated from 4847 observations, while others in this table and above table are calculated from 202 countries.
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+covid_table  = table_2[c(1,2,12:15),]
+covid_table = flextable(covid_table)
+covid_table = width(covid_table, j = NULL, 6, unit = "in")
+covid_table = fontsize(covid_table, i = NULL, j = NULL, size = 9, part = "body")
+autofit(covid_table, add_w = 0.1, add_h = 0.1, part = c("body", "header"), unit = "in")
+
+```
+
+ - The cumulative case rate and cumulative case fatality rate are severely right skewed. Thus there are very few countries having extremely high case rate and case fatality rate.
+ 
+ - The earliest first vaccine date is 2020 Jul.22th. In addition, we can see that about half countries first started to use vaccine during 2021 January and 2021 March. And the monthly vaccine rate is right skewed.
+ 
+ - Also, for some months in several countries, the increased case rate is extremely high. Thus the monthly new case rate is right skewed, indicating that we need to do some transformation later.
+
+
+## Visualization
+
+### Case rate
+
+First, we can have a look at the cases rate, which is represented by the variable 'cases per 100000 persons'. Left the is the boxplot of current(by 2022 Feb.23) cumulative case rate versus region. The region AFRO, AMRO, SEARO, EURO, EMRO,WPRO stands for African region, region of the Americas, South-East Asian region, European region, Eastern Mediterranean region and Western Pacific region, respectively. We can observe that EURO has the highest level of case rate and the largest interquartile range, while AFRO seems to have the lowest level of case rate and smallest interquartile range. SEARO and WPRO have a slightly higher level of case rate than AFRO. From the boxplot of current cases(by 2022 Feb.23) versus income, we can roughly conclude that high income level countries have a higher case rate, while the low income level countries have the lower case rate than other income levels. 
+
+```{r echo=FALSE, fig.align="center", fig.height=3.5, fig.width=9.5}
+current_case_rate = unique(visdata1[,c(1,3,5,27)])
+current_case_rate = current_case_rate[is.na(current_case_rate$region)==F,]
+p1 = ggplot(current_case_rate, aes(x=region, y=current_cases_per_100000, fill=region)) +
+  geom_boxplot()+ 
+  labs(x="Region",y="Current cases per 100000",title = "Current cases per 100000 vs region")+
+  scale_fill_brewer(palette="BuPu")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+p2 = ggplot(current_case_rate, aes(x=income, y=current_cases_per_100000, fill=income)) +
+  geom_boxplot()+ 
+  labs(x="Income Level",y="Current cases per 100000",title = "Current cases per 100000 vs income")+
+  scale_fill_brewer(palette="BuPu")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+grid.arrange(p1, p2, nrow = 1,ncol = 2)
+```
+
+
+From the multigroup boxplot below, we can see that not every region contains all income levels. Only AFRO and EMRO contain the low income level countries. We can see that case rate of high income level varies the most across different regions. For almost all regions, the high income level holds a higher case rate, except for EMRO where the case rates of high income level and upper middle income level are very close. Particularly, the high income countries in EURO has the highest case rate than any other region-income combinations. And the case rate of the only high income country Seychelles in AFRO has a large gap with case rate of other income levels in AFRO. 
+
+```{r fig.align="center", echo = FALSE,fig.height=4}
+current_case_rate %>% 
+  ggplot(aes(x=region, y=current_cases_per_100000, fill=factor(income))) +
+  scale_fill_brewer(palette="BuPu")+
+  geom_boxplot()+
+  labs(x="Region",y="current cases per 100000",title = "Current cases per 100000 grouped by region and income")+
+  theme(plot.title = element_text(hjust = 0.5)) 
+
+## Seychelles in AFRO high income  extremely high case rate
+```
+Below are the time series plots for the averaged monthly new case rate of each region and each income level. From the left graph, we can see that the trends of monthly new case rate vary in different regions. Particularly, for most time, EURO region has a significantly higher new case rate than other regions. We can observe that case rates of EURO and AMRO have a dramatic increase after 2021 October, and this is possibly because of the outbreak of Omicron variant. For other regions, their new case rates have decreased generally after reaching their own peaks. From the right plot, similarly, we can find the new case rate in high income countries has increased dramatically after 2021 October. Before this dramatic increase and except for its peak around 2021 January, we can conclude that the new case rates of high income and upper middle income are kind of close to each other.
+
+```{r echo=FALSE, fig.align="center", fig.height=3.5, fig.width=9.5, message=FALSE, warning=FALSE}
+region_case_change = visdata1 %>% group_by(region,date) %>% summarise(monthly_cases_rate = mean(monthly_new_case_per_100000)) 
+
+p1 = ggplot(data = region_case_change, mapping = aes(x = as.Date(date,"%Y%m%d"), y = monthly_cases_rate, colour = region)) +
+  geom_line()+
+  labs(x="Time",y="Monthly new cases per 1000000",title = "Time series of monthly new case rate by region")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+income_case_change = visdata1 %>% group_by(income,date) %>% summarise(monthly_cases_rate = mean(monthly_new_case_per_100000)) 
+
+p2 = ggplot(data = income_case_change, mapping = aes(x = as.Date(date,"%Y%m%d"), y = monthly_cases_rate, colour = income)) +
+  geom_line()+
+  labs(x="Time",y="Monthly new cases per 1000000",title = "Time series of monthly new case rate by income")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+grid.arrange(p1, p2, nrow = 1,ncol = 2)
+
+warnings('off')
+
+
+```
+
+
+
+
+
+#### Case rate vs possible numeric variables
+
+In this subsection, we can have a preliminary look at the how the possible factors are associated with the case rate. Here we generally show the plots of case rate versus life expectancy and gdp per capita. To better capture the relationship between variables, in some plots we take a 0.14 power on the response, which is suggested from the Box-Cox transformation applied in model fitting section.
+
+The upper left plot shows the relation between current cumulative case rate(by 2022 Feb.23rd) and life expectancy of each country. We can see that AFRO has the lowest life expectancy, while EURO has the highest life expectancy. The case rate and life expectancy are positively correlated. After taking a 0.14 power on current cumulative case rate, we can observe some positive linear relation between these two variables. Lower left is the plot for monthly new case rate taking 0.14 power versus life expectancy. And the positive correlation is still somehow significant.
+
+```{r echo=FALSE, fig.align="center", fig.height=6, fig.width=10, message=FALSE, warning=FALSE}
+# life expectancy  posi
+p1 = ggplot(data=section, aes(x=life_expectancy, y=current_cases_per_100000, color=region))+
+  geom_point(size=1)+
+  labs(x="Life expectancy",y="Current cases per 1000000",title = "Current cases per 1000000 vs life expectancy")+
+  theme(plot.title = element_text(hjust = 0.5))
+p2 = ggplot(data=section, aes(x=life_expectancy, y=current_cases_per_100000^0.14, color=region))+
+  geom_point(size= 1)+
+  labs(x="Life expectancy",y="(Current cases per 1000000)^0.14",title = "(Current cases per 1000000)^0.14 vs life expectancy")+
+  theme(plot.title = element_text(hjust = 0.5))
+p3 = ggplot(data=visdata1, aes(x=life_expectancy, y=monthly_new_case_per_100000^0.14, color=region))+
+  geom_point(size=1)+
+  labs(x="Life expectancy",y="(Monthly new cases per 1000000)^0.14",title = "(Monthly new cases per 1000000)^0.14 vs life expectancy")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+grid.arrange(p1, p2,p3, nrow = 2,ncol = 2)
+```
+
+
+From the plots below, we can see that EURO countries have the highest gdp per capita while AFRO has the lowest gdp per capita. After taking a 0.14 power on cumulative case rate and monthly new case rate, we can see some positive linear association between case rate and log(gdp per capita).  
+
+```{r echo=FALSE, fig.align="center", fig.height=6, fig.width=10, message=FALSE, warning=FALSE}
+# gdp take log posi
+p1 = ggplot(data=section, aes(x=gdp_per_capita, y=current_cases_per_100000, color=region))+
+  geom_point(size=1)+
+  labs(x="Gdp per capita",y="Current cases per 1000000",title = "Current cases per 1000000 vs gdp per capita")+
+  theme(plot.title = element_text(hjust = 0.5))
+p2 = ggplot(data=section, aes(x=log(gdp_per_capita), y=current_cases_per_100000^0.14, color=region))+
+  geom_point(size=1)+
+  labs(x="log(Gdp per capita)",y="(Current cases per 1000000)^0.14",title = "(Current cases per 1000000)^0.14 vs log(Gdp per capita)")+
+  theme(plot.title = element_text(hjust = 0.5))
+p3 = ggplot(data=visdata1, aes(x=log(gdp_per_capita), y=monthly_new_case_per_100000^0.14, color=region))+
+  geom_point(size=1)+
+  labs(x="log(Gdp per capita)",y="(Monthly new cases per 1000000)^0.14",title = "(Monthly new cases per 1000000)^0.14 vs log(Gdp per capita)")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+grid.arrange(p1, p2,p3, nrow = 2,ncol = 2)
+
+```
+
+
+Also, the scatter plots for case rate and other factors are drawn, which are not displayed here. We can find that the case rate has a negative association with cardiovasc death rate, but has positive associations with handwashing facility rate, hospital beds rate and age variables. However, we cannot observe a significant association between population density and case rate. 
+
+```{r eval=FALSE, include=FALSE}
+# pop density
+plot(log(section[section$population_density<1000,]$current_cases_per_100000)~section[section$population_density<1000,]$population_density) ### no information from pop density
+```
+
+
+
+```{r eval=FALSE, include=FALSE}
+# cardiovasc_death_rate neg  
+plot(section$current_cases_per_100000~section$cardiovasc_death_rate)
+plot(section$current_cases_per_100000^0.14~section$cardiovasc_death_rate)
+plot(visdata1$monthly_new_case_per_100000^0.14~visdata1$cardiovasc_death_rate)
+plot(visdata1$monthly_new_case_per_100000~visdata1$cardiovasc_death_rate)
+
+# handwashing  posi  
+plot(section$current_cases_per_100000~section$handwashing_facilities)
+plot(section$current_cases_per_100000^0.14~section$handwashing_facilities)
+plot(visdata1$monthly_new_case_per_100000^0.14~visdata1$handwashing_facilities)
+plot(visdata1$monthly_new_case_per_100000~visdata1$handwashing_facilities)
+
+
+# beds  posi 
+plot(section$current_cases_per_100000^0.14~log(section$hospital_beds_per_thousand))
+plot(section$current_cases_per_100000^0.14~section$hospital_beds_per_thousand)
+
+# life_expectancy  posi  
+plot(section$current_cases_per_100000^0.14~section$life_expectancy)
+```
+
+
+
+
+
+
+### Vaccination rate
+
+From the time series plots below, we can see that the fully vaccinated rate of AFRO has increased significantly slower than other countries, while the blue line indicating that countries in EURO generally have a higher fully vaccinated rate than other regions. Also, it is clear that the growth of fully vaccinated rate decreases with respect to the decline of income level.
+
+```{r echo=FALSE, fig.align="center", fig.height=3.5, fig.width=9.5, message=FALSE, warning=FALSE}
+region_vaccine_change = visdata1 %>% group_by(region,date) %>% summarise(monthly_fully_vaccine_rate = mean(monthly_fully_people_vaccinated_per,na.rm = T)) 
+
+p1 = ggplot(data = region_vaccine_change, mapping = aes(x = as.Date(date,"%Y%m%d"), y = monthly_fully_vaccine_rate, colour = region)) +
+  geom_line()+
+  labs(x="Time",y="Cumulative fully vaccinated per 100",title = "Time series of fully vaccinated rate by region")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+income_vaccine_change = visdata1 %>% group_by(income,date) %>% summarise(monthly_fully_vaccine_rate = mean(monthly_fully_people_vaccinated_per,na.rm = T)) 
+
+p2 = ggplot(data = income_vaccine_change, mapping = aes(x = as.Date(date,"%Y%m%d"), y = monthly_fully_vaccine_rate, colour = income)) +
+  geom_line()+
+  labs(x="Time",y="Cumulative fully vaccinated per 100",title = "Time series of fully vaccinated rate by income")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+grid.arrange(p1, p2, nrow = 1,ncol = 2)
+```
+
+#### Case rate vs vaccination rate
+
+The plots below show that case rate seems to have some positive association with the fully vaccinated rate. The reason for this is discussed in section 4.5.4 and the "true" relationship between vaccination rate and case rate is examined in that part. 
+```{r echo=FALSE, fig.align="center", fig.height=6, fig.width=10, message=FALSE, warning=FALSE}
+# vaccine posi
+# plot(section$current_cases_per_100000~section$cum_fully_people_vaccinated_per)
+# plot(section$current_cases_per_100000^0.14~section$cum_fully_people_vaccinated_per)
+# plot(visdata1$monthly_new_case_per_100000^0.14~visdata1$monthly_fully_people_vaccinated_per)
+
+
+p1 = ggplot(data=section, aes(x=cum_fully_people_vaccinated_per, y=current_cases_per_100000, color=region))+
+  geom_point(size=1)+
+  labs(x="Fully vaccinated rate",y="Current cases per 1000000",title = "Current cases per 1000000 vs fully vaccinated rate")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+p2 = ggplot(data=section, aes(x=cum_fully_people_vaccinated_per, y=current_cases_per_100000^0.14, color=region))+
+  geom_point(size=1)+
+  labs(x="Fully vaccinated rate",y="Current cases per 1000000^0.14",title = "Current cases per 1000000^0.14 vs fully vaccinated rate")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+p3 = ggplot(data=visdata1, aes(x=monthly_fully_people_vaccinated_per, y=monthly_new_case_per_100000^0.14, color=region))+
+  geom_point(size=1)+
+  labs(x="Monthly fully vaccinated rate",y="(Monthly new cases rate)^0.14",title = "(Monthly new cases rate)^0.14 vs Monthly fully vaccinated rate")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+grid.arrange(p1, p2,p3, nrow = 2,ncol = 2)
+```
+
+
+
+### Case fatality rate
+
+Below are the box plots for case fatality rate for the entire covid 19 period. We can see that EURO and WPRO have the lowest case fatality rate. And the case fatality rate increases with respect to the decline of income level. The outlier we observe in EMRO and low income is Yemen, where the case fatality rate is extremely high than other countries.
+```{r echo=FALSE, fig.align="center", fig.height=3, fig.width=9.5, message=FALSE, warning=FALSE}
+section$cum_cfr = section$current_deaths_per_100000/section$current_cases_per_100000
+
+p1 = ggplot(section, aes(x=region, y=cum_cfr, fill=region)) +
+  geom_boxplot()+ 
+  labs(x="Region",y="Current case fatality rate",title = "Current case fatality rate vs region")+
+  scale_fill_brewer(palette="BuPu")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+p2 = ggplot(section, aes(x=income, y=cum_cfr, fill=income)) +
+  geom_boxplot()+ 
+  labs(x="Income Level",y="Current case fatality rate",title = "Current case fatality rate vs income")+
+  scale_fill_brewer(palette="BuPu")+
+  theme(plot.title = element_text(hjust = 0.5))
+### outlier Yemen
+grid.arrange(p1, p2, nrow = 1,ncol = 2)
+```
+
+
+
+
+
+# Model building
+
+In this section, we mainly use Lasso regression to select important variables, and then use ordinary least squares regression(OLS) and mixed effect linear regression and anova table to draw inferential analysis on the association between factors and monthly new case rate. 
+
+```{r include=FALSE}
+regression_data = merge_income_[,c(1,2,3,9,10,11,12,13,14,15,16,17,20,21,27)] 
+regression_data = regression_data[regression_data$monthly_new_case_per_100000>=0,]
+
+regression_data1 = na.omit(regression_data)
+dim(regression_data1) 
+#View(regression_data1)
+length(unique(regression_data1$country))
+```
+
+Since handwashing facility rate is not collected for nearly half of the countries and some other explanatory variables are missing from a certain proportion of countries, we firstly work on data without missing variables. Hence at this moment, there are 1579 observations included in the model. The response is monthly new case rate, and the explanatory variables include region, income, population density, median age, aged 65 older, aged 70 older rate, gdp per capita, cardiovasc death rate, handwashing facility rate, hospital beds rate, life expectancy and monthly fully vaccinated rate (12 variables in total).
+
+## Transformation on data
+Without any transformation and interaction terms on variables, we fit a OLS regression model. From the model diagnostics plots(Appendix.Figure1, Appendix.Figure2), there are strong linear pattern between residuals and fitted values. The QQ-plot suggests that the distribution of residuals are very different from normal distribution. 
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+# preliminary fit
+fit_pre = lm((monthly_new_case_per_100000) ~ .-country-date,data = regression_data1[-c(965,970,109),])
+```
+
+To modify this problem, after taking a logarithm on gdp per capita, we applied Box-Cox transformation with $\lambda=0.1010101$. Note that to apply Box-Cox transformation, we have to make sure that the responses are positive. Here we delete 162 observations whose monthly new case rate are exactly 0 from the 1579 observations. We can see that the original distribution of monthly new case rate is severely right skewed, while the transformed monthly new case rate is much closer to bell shaped distribution.
+```{r include=FALSE}
+regression_data1 = regression_data1[regression_data1$monthly_new_case_per_100000>0,]
+```
+
+
+```{r eval=FALSE, include=FALSE}
+bc = boxcox(monthly_new_case_per_100000~.-country-date-gdp_per_capita+log(gdp_per_capita),data = regression_data1)
+bc$x[which(bc$y==max(bc$y))]
+```
+
+
+
+```{r echo=FALSE, fig.align="center", fig.height=4, fig.width=7.5}
+p1 = ggplot(regression_data1, aes(x=monthly_new_case_per_100000)) + 
+  geom_histogram(binwidth=200) +
+  labs(title = "Histogram before transformation",x = "monthly new case per 100000")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+regress_data1 = regression_data1
+regress_data1$trans = regress_data1$monthly_new_case_per_100000^0.1010101
+p2 = ggplot(regress_data1, aes(x=trans)) + 
+  geom_histogram(binwidth=0.05) +
+  labs(title = "Histogram after transformation", x = "(monthly new case per 100000)^0.1010101")+
+  theme(plot.title = element_text(hjust = 0.5))
+  
+grid.arrange(p1, p2, nrow = 1,ncol = 2)
+```
+
+## Variable selection
+
+
+Firstly we fit a linear model in the form:
+$$
+Y_i = \beta_0 + \sum_{j\neq 0} X_{ij} \beta_j + \epsilon_i
+$$
+ 
+ - $Y=$(monthly new case per 100000)$^{0.1010101}$
+
+ - $X_{ij}$ include 
+   
+   - numeric variables including population density, median age, aged 65 older rate, aged 70 older rate, cardiovasc death rate, handwashing facilities rate, hospital beds rate, life expectancy, log(gdp per capita) and monthly fully vaccinated rate. 
+   
+   - dummy variables from region and income.
+
+
+According to t test from summary of the fitted model, we can see that significant variables are region, income, log(gdp per capita) and monthly fully vaccinated rate. However, we should also notice that the VIF value of some variables are much large than 10, which suggests significant multicollinarity. 
+
+```{r include=FALSE}
+fit0 = lm((monthly_new_case_per_100000)^0.1010101 ~ .-country-date-gdp_per_capita+log(gdp_per_capita),data = regression_data1) 
+summary(fit0)
+```
+
+
+```{r echo=FALSE}
+ols_vif_tol(fit0)
+```
+
+To solve the problem of multicollinearity, and more importantly, find factors that are most significantly associated with monthly new case rate, we now apply $LASSO$ regression to select variables. Based on ordinary linear regression which gives unbiased estimator for coefficients, Lasso algorithm simply adds regularization on the $l_1$ norm of the coefficients with a hyperparameter $\lambda$. With the regularization on model complexity, Lasso tends to select a simpler model. That is, when $\lambda$ gets larger and larger, the coefficients of some variables will be shrank to exactly 0, which means some variables are excluded from our model due to less importance.
+
+The Lasso model(the same as the ordinary linear regression, except for the generalization part):
+$$
+Y_i = \beta_0 + \sum_{j\neq 0} X_{ij} \beta_j + \epsilon_i + \lambda \sum \left| \beta_j\right|
+$$
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+lasso_data = merge_income_[,c(3,9,10,11,12,13,14,15,16,17,20,21,27)]
+lasso_data$gdp_per_capita = log(lasso_data$gdp_per_capita)
+lasso_data$monthly_new_case_per_100000 = (lasso_data$monthly_new_case_per_100000)^0.1010101
+lasso_data = lasso_data[lasso_data$monthly_new_case_per_100000>0,]
+lasso_data = na.omit(lasso_data)
+#View(lasso_data)
+
+lambda_seq =  10^seq(-2,1,by = 0.0001)
+
+x = model.matrix(monthly_new_case_per_100000~.,lasso_data)[,-1]
+x = as.matrix(x)
+y = lasso_data[,12]
+y = as.matrix(y) 
+cv_output = cv.glmnet(x,y,alpha = 1,lambda = lambda_seq)
+
+best_lambda = cv_output$lambda.min
+
+lasso_model = glmnet(x,y,alpha = 1,lambda = best_lambda)
+
+
+coef(lasso_model)
+```
+
+
+
+
+
+With 10-fold cross validation, the optimal hyperparameter selected is $\lambda=0.01$. By Lasso regression, coefficients of less important variables are shrank to 0, thus the selected important variables are region, income, median age, log(gdp per capita), life expectancy, monthly fully vaccinated rate(Appendix.Table1). 
+
+
+After deleting cardiovasc_death_rate, handwashing_facilities and hospital_beds_per_thousand, which are determined to be less significant and also missing from amount of countries, we can now work on a larger data set. Now we have 3432 observations with 174 countries included. Box-Cox transformation suggests the optimal transformation power should be 0.1414141.
+
+```{r include=FALSE}
+regression_data2 = regression_data[regression_data$monthly_new_case_per_100000>0,-c(4,6,7,9,10,11)]
+regression_data2 = na.omit(regression_data2)
+
+regression_data2 = regression_data2[order(regression_data2$country, regression_data2$date),]
+rownames(regression_data2) = 1:nrow(regression_data2)
+
+dim(regression_data2)
+length(unique(regression_data2$country))
+
+bc = boxcox(monthly_new_case_per_100000~.-country-date-gdp_per_capita+log(gdp_per_capita),data = regression_data2)
+bc$x[which(bc$y==max(bc$y))]
+```
+
+
+We can fit a linear regression model with the form:
+$$
+Y_i = \beta_0 + \sum_{j\neq 0} X_{ij} \beta_j + \epsilon_i
+$$
+ 
+ - $Y=$(monthly new case per 100000)$^{0.1414141}$
+
+ - $X_{ij}$ include 
+   
+   - numeric variables including median age, life expectancy, log(gdp per capita) and monthly fully vaccinated rate. 
+   
+   - dummy variables from region and income.
+   
+ - $\epsilon_i$ is assumed to be iid $N(0,\sigma^2)$.
+
+
+```{r include=FALSE}
+fit1 = lm((monthly_new_case_per_100000)^0.1414141~.-country-date-gdp_per_capita+log(gdp_per_capita),data = regression_data2)
+summary(fit1)
+```
+
+According to the t-test, the p value of estimated coefficient of median age is 0.193429, thus the median age is suggested to be insignificant at a 0.05 level. Also, the step regression with both AIC and BIC criterion suggest to delete the median age. So finally, the table below shows variables found to be most significantly associated with the monthly new case rate. 
+
+```{r include=FALSE}
+aic_model1 = step(fit1,k = 2,trace = F)
+bic_model1 = step(fit1,k = log(dim(regression_data1)[1]),trace = F)
+summary(aic_model1)
+summary(bic_model1)
+
+AIC(aic_model1,bic_model1)
+BIC(aic_model1,bic_model1)
+#From bic_model1, we can obtain a set of variables.
+```
+
+
+```{r include=FALSE}
+fit1_2 = lm((monthly_new_case_per_100000)^0.1414141 ~ region+ income + life_expectancy + log(gdp_per_capita)+ monthly_fully_people_vaccinated_per, data = regression_data2)
+summary(fit1_2)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+tbl_regression(fit1_2,pvalue_fun = ~style_pvalue(.x, digits =3))  %>%
+   as_gt() %>%
+  gt::tab_options(table.font.size = "small")
+```
+
+
+
+
+## Inference results
+
+From the table model above, region, income, life expectancy, log(gdp per capita) and monthly fully vaccinated rate are the factors we find to be most significantly associated with monthly new case rate. And we can draw some inferences here:
+
+ - Compared to AFRO, countries in AMRO and EURO tend to have a higher monthly new case rate, while countries in SEARO and WPRO tend to have a lower monthly new case rate. However, case rate across region will be carefully compared in 4.5.3. 
+ 
+ - Compared to high income, countries in low income level tend to have a lower monthly new case rate, while countries of upper middle income level tend to have a higher monthly new case rate. This will also be discussed in 4.5.3.
+ 
+ - Larger life expectancy tends to be associated with larger monthly new case rate. Although larger life expectancy generally means higher health quality of nations, life expectancy can also somehow reflect the age composition of a country. To be more specific, if we draw a scatter plot of life expectancy vs aged_over_65, we can clearly see a positive relationship between them. Since other three variables related to age are removed due to multicollinearity, life expectancy here can represent the severity of aging issue of a country. Generally speaking, we can see the positive association between aging issue of a country and the monthly new case rate. 
+ 
+ - Larger gdp per capita tends to cause larger monthly new case rate. This is might because the prosperous economies generally have a higher level of internationalization and population mobility, which would increase the risk of close contact with infected ones.
+ 
+ - Higher monthly fully vaccinated rate is associated with higher monthly new case rate in this model, which seems to fit our observation in visualization. Again, this will be further discussed in 4.5.4.
+
+
+## Sensitivity analysis
+
+Overall, the model assumptions are not severely violated:
+
+ - Bonferroni suggests no significant outlier.
+ 
+ - No VIF larger than 10 suggests no multicollinearity.
+ 
+ - The residuals vs fitted plot shows the residuals are evenly distributed on both sides of the horizontal line and there is no linear patterns or trends. Thus the constant variance assumption is satisfied.
+ 
+ - Though the p value of shapiro test is 4.334e-07, which suggests the normality is not well satisfied, the qqplot shows that the distribution of residuals are very close to normal distribution. 
+ 
+```{r include=FALSE}
+#### Outlier   Bonferroin test suggest no outlier
+outlierTest(fit1_2)
+```
+
+```{r include=FALSE}
+ols_vif_tol(fit1_2)  ## no large vif than 10
+```
+
+```{r echo=FALSE, fig.align="center",fig.height=4, fig.width=5, message=FALSE, warning=FALSE}
+##### sensitivity analysis for fit1_2
+p1 = qqPlot(fit1_2,main = "QQplot of residuals",id=FALSE)
+
+p2 = ggplot(fit1_2, aes(fitted.values(fit1_2), resid(fit1_2))) + 
+  geom_hline(yintercept=0,linetype="dashed") +
+  geom_point()+
+  geom_smooth()+
+  labs(x="fitted",y="residual",title = "residual vs fitted")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+p2
+#shapiro.test(fit1_2$residuals)
+```
+
+## Section discussion 
+
+### Interaction effects
+
+Additionally, we now want to see whether interaction of region and income have an effct on case rate increasing. 
+
+From the interaction plot below, the interaction between region and income might be effective for monthly new case rate. So we add the interaction of region and income and call this full model, while the reduced model is the previous one in 4.2. Under $H_0:$ the interaction is insignificant, $F^*=\frac{ [{\rm SSE}_{\rm red}-{\rm SSE}_{\rm full}  ] / [ df_{\rm red}-df_{\rm full}   ]  }{ {\rm SSE}_{\rm full}/df_{\rm full}}$ has an F distribution with degree(10,3410). The 6.042e-06 p-value from F-test suggests to reject null hypothesis. So, in addition to the additive model, the interaction term between region and income are significantly associated with monthly new case rate.
+
+Similarly, we conducted sensitivity analysis with residual vs fitted plot(Appendix.Figure3) and qqplot(Appendix.Figure4), and there is no severe assumption violation.
+
+```{r echo=FALSE,fig.align="center",fig.height=4, fig.width=5}
+interaction.plot(regression_data2$income, regression_data2$region,(regression_data2$monthly_new_case_per_100000)^0.1414141,xlab = "income", ylab = "transformed monthly new case rate", main = "Interaction plot")
+
+### consider interaction term
+```
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+### lasso data
+
+lasso_data2 = merge_income_[,c(3,13,17,20,21,27)]
+lasso_data2$gdp_per_capita = log(lasso_data2$gdp_per_capita)
+lasso_data2 = lasso_data2[lasso_data2$monthly_new_case_per_100000>0,]
+lasso_data2$monthly_new_case_per_100000 = (lasso_data2$monthly_new_case_per_100000)^0.1414141
+lasso_data2 = na.omit(lasso_data2)
+
+
+x = model.matrix(monthly_new_case_per_100000~.,lasso_data2)[,-1]
+x = as.matrix(x)
+y = lasso_data2[,5]
+y = as.matrix(y) 
+
+# standardize
+
+x_cate = x[,c(1:5,9:11)] 
+x_num = x[,c(6:8)]
+x_std = apply(x_num,2, function(x) (x-mean(x))/sd(x)) 
+
+# create meta features
+
+power_2 = apply(x_std,2, function(x) x^2)
+colnames(power_2) = c("gdp_per_capita2", "life_expectancy2" ,"monthly_fully_people_vaccinated_per2")
+x_var = cbind(x_cate,x_std,power_2)
+
+
+### lasso regression
+lambda_seq =  10^seq(-2,2,by = 0.0001)
+cv_output = cv.glmnet(x_var,y,alpha = 1,lambda = lambda_seq,standardize=FALSE)
+
+best_lambda = cv_output$lambda.min
+
+lasso_model = glmnet(x_var,y,alpha = 1,lambda = best_lambda)
+
+
+coef(lasso_model)
+```
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+fit2 = lm((monthly_new_case_per_100000)^0.1414141 ~ region* income + life_expectancy + log(gdp_per_capita)+ monthly_fully_people_vaccinated_per, data = regression_data2)
+summary(fit2)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+anova(fit2)
+```
+
+
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+##### sensitivity analysis for fit2_aic
+ggplot(fit2, aes(fitted.values(fit2), resid(fit2))) + 
+  geom_hline(yintercept=0,linetype="dashed") +
+  geom_point()+
+  geom_smooth()+
+  labs(x="fitted",y="residual",title = "Figure3: residual vs fitted")+
+  theme(plot.title = element_text(hjust = 0.5))
+qqPlot(fit2,main = "Figure4: QQplot of residuals")
+
+
+shapiro.test(fit2$residuals)
+
+```
+
+
+
+
+### Mixed effect model
+
+Since there are multiple observations over time for each country(subject), the data we analyze can be seen as longitudinal data[7]. With country as random effect factor and {region, income, life expectancy, log(gdp per capita), monthly fully vaccinated rate} as fixed effect factor, we can build a mixed effect linear model:
+
+$$
+Y_{it} = \beta_{00} + \sum_{j\neq0}\beta_{0j}x_{i_j} + \beta_{10}x_{it}\  \ \ \   (fixed\ effects) \\
++ \gamma_{i0} + \epsilon_{it} \  \ \ \   (random\ effects)
+$$
+ 
+ - $Y_{ij}$ denotes the response of $ith$ country at time t(month).
+
+ - $x_{i_j}$ denotes time-invariant variables, including region, income, life expectancy, log(gdp per capita) and possibly interaction term of region and income.
+
+ - $x_{it}$ denotes time-variant variable, which is monthly fully vaccinated rate here.
+
+ - $\gamma_{i0}$ denotes the random effect by country.
+
+ - $\epsilon_{it}$ is assumed to be iid $N(0,\sigma^2)$.
+
+
+```{r include=FALSE}
+random.model2 = lmer((monthly_new_case_per_100000)^0.1414141 ~ region+ income+ region*income+ life_expectancy+log(gdp_per_capita)+ monthly_fully_people_vaccinated_per+(1|country), data = regression_data2,REML=FALSE)
+step(random.model2,trace=F)
+```
+
+```{r include=FALSE}
+random.model2_2 = lmer((monthly_new_case_per_100000)^0.1414141 ~ region + income + log(gdp_per_capita) + monthly_fully_people_vaccinated_per + (1 | country), data = regression_data2)
+summary(random.model2_2)
+```
+
+
+Different from the OLS, here the life expectancy and interaction term of region and income are no longer significant in the mixed effect model. By stepwise regression, the model found shows that region, income, log(gdp_per_capita) and monthly fully vaccinated rate are significant variables. And the fixed factors generally have similar effects on monthly new case rate as models fitted before, except for the change of sign of lower middle income. For the model sensitivity, the residual plots(Appendix.Figure5,Appendix.Figure6) suggest that model assumptions are not severely violated.
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+# sensitivity analysis for random.model2_2
+plot(random.model2_2)
+qqPlot(residuals(random.model2_2))
+```
+
+
+
+### Comparison across region and income level
+
+Since we have found that region and income both have significant effects on monthly new case rate, we can take a further step to examine whether there are significant difference between pairwise regions or income levels, or whether we can rank the severity of infection status across regions or income levels. So now we apply a two-way anova:
+$$
+Y_{ijk} = \mu+\alpha_i +\beta_j + (\alpha\beta)_{ij}+\epsilon_{ijk}
+$$
+where the $\alpha_i$ stands for the effect of region, $\beta_j$ stands for the effect of income and $\alpha\beta_{ij}$ stands for the interaction of region and income. To test the significance of pairwise difference simultaneously, we use Tukey's range test at a 0.05 level.
+
+
+```{r include=FALSE}
+#### see whether there are highest region or income level  So apply anova
+anova.fit1 = aov((monthly_new_case_per_100000)^0.1414141 ~ region*income, data = regression_data2)
+anova(anova.fit1)
+```
+
+
+From the region difference table shown below, we can easily find that most intervals exclude 0, except for the difference between WPRO and AFRO. That is, the rank for regions with respect to monthly new case rate from high to low should be: EURO, AMRO, EMRO, SEARO, WPRO$\approx$AFRO. Here the null hypothesis that monthly new case rate of WPRO and AFRO are equal is failed to reject.
+
+
+```{r echo=FALSE}
+sig.level=0.05
+T.ci1=TukeyHSD(anova.fit1,"region",conf.level = 1-sig.level)
+region_interval = data.frame(T.ci1[["region"]])
+region_diff = rownames(region_interval)
+region_interval = data.frame(cbind(region_diff,region_interval))[,-5]
+region_table = flextable(region_interval)
+region_table = width(region_table, j = NULL, 1.2, unit = "in")
+region_table = fontsize(region_table, i = NULL, j = NULL, size = 9, part = "body")
+autofit(region_table, add_w = 0.1, add_h = 0.1, part = c("body", "header"), unit = "in")
+### EURO highest case rate
+```
+
+
+From the income difference table shown below, we can also find that most intervals exclude 0, except for the difference between high income and upper middle income. That is, the rank for income with respect to monthly new case rate from high to low should be: high$\approx$upper middle, lower middle, low. Here the null hypothesis that monthly new case rate of high and upper middle income level are equal is failed to reject.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+T.ci2=TukeyHSD(anova.fit1,"income",conf.level = 1-sig.level)
+income_interval = data.frame(T.ci2[["income"]])
+income_diff = rownames(income_interval)
+income_interval = data.frame(cbind(income_diff,income_interval))[,-5]
+income_table = flextable(income_interval)
+income_table = width(income_table, j = NULL, 1.6, unit = "in")
+income_table = fontsize(income_table, i = NULL, j = NULL, size = 9, part = "body")
+autofit(income_table, add_w = 0.1, add_h = 0.1, part = c("body", "header"), unit = "in")
+# plot(T.ci2,las=1 , col="brown")
+### low lowest case rate
+```
+
+
+Though the null hypothesis of shapiro test and levene test are rejected, the model diagnostics plots show that there are no severe violation for normality and homoscedasticity assumptions(Appendix.Figure7,Appendix.Figure8).
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+#### sensitivity analysis
+qqPlot(anova.fit1)
+ggplot(anova.fit1, aes(fitted.values(anova.fit1), resid(anova.fit1))) + 
+  geom_hline(yintercept=0,linetype="dashed") +
+  geom_point()+
+  geom_smooth()+
+  labs(x="fitted",y="residual",title = "residual vs fitted")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+## test for sensitivity analysis
+#shapiro.test(anova.fit1$residuals) 1.175e-06
+## leveneTest((monthly_new_case_per_100000)^0.1414141 ~ region*income, data = regression_data2) 
+```
+
+
+
+
+### Effect of vaccination on case rate
+
+In the previous analysis, we have found that the monthly fully vaccinated rate is positively associated with the monthly new case rate. So in this subsection, we try to seek an explanation for it. We previously observed that the countries of high income and EURO generally have had a dramatic increase on case rate after the appear of Omicron in 2021 October, however, these countries are usually among those who have the highest vaccination rate. The dramatic increase of case rate might be due to lots of complicated reasons, like policy, transportation, business, culture and so on. So the effect of vaccine on case rate might be masked by the emergency of Omicron.
+
+Therefore, we extract the observations before November of 2021 and after the first vaccine date to conduct analysis.Now we have 1058 observations in total.
+
+```{r include=FALSE}
+data3 = regression_data2[regression_data2$date<"20211110" & regression_data2$monthly_fully_people_vaccinated_per!=0,]
+dim(data3)
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+Sys.setlocale("LC_TIME", "English")
+```
+
+
+```{r echo=FALSE, fig.align="center", fig.height=3, fig.width=9.5, message=FALSE, warning=FALSE}
+region_case_change = data3  %>% group_by(region,date) %>% summarise(monthly_cases_rate = mean(monthly_new_case_per_100000)) 
+
+p1 = ggplot(data = region_case_change, mapping = aes(x = as.Date(date,"%Y%m%d"), y = monthly_cases_rate, colour = region)) +
+  geom_line()+
+  labs(x="Time",y="Monthly new cases per 1000000",title = "Monthly new case rate by region")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+p2 = ggplot(data=data3, aes(x=monthly_fully_people_vaccinated_per, y=monthly_new_case_per_100000^0.14, color=region))+
+  geom_point(size=1)+
+  labs(x="Monthly fully vaccinated rate",y="(Monthly new case per 100000)^0.14",title = "(Monthly new cases rate)^0.14 vs Monthly fully vaccinated rate")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+grid.arrange(p1, p2, nrow = 1,ncol = 2)
+```
+
+If we fit an OLS linear regression model with variable region*income, life expectancy, log(gdp_per_capita) and monthly fully vaccinated rate, we can see that the monthly fully vaccinated rate is no longer significantly positively associated with the monthly new case rate. The coefficient becomes -0.0012839, and it is significant at 0.1 confidence level with a 0.058267 p-value from t-test.
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+fit_before_omi = lm((monthly_new_case_per_100000)^0.1414141 ~ region*income+ life_expectancy+log(gdp_per_capita)+ monthly_fully_people_vaccinated_per, data = data3)
+summary(fit_before_omi)
+
+```
+
+From the shapiro test with p value 0.06511 and the qqplot, the normality assumption is well satisfied. Also, the equal variance assumption is not severely violated(Appendix.Figure9,Appendix.Figure10).
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+ggplot(fit_before_omi, aes(fitted.values(fit_before_omi), resid(fit_before_omi))) + 
+  geom_hline(yintercept=0,linetype="dashed") +
+  geom_point()+
+  geom_smooth()+
+  labs(x="fitted",y="residual",title = "residual vs fitted")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+qqPlot(fit_before_omi,main = "qqPlot")
+shapiro.test(residuals(fit_before_omi))
+```
+
+Next, we also fit a mixed effects model. We now find the significant variables are region, income, interaction of region and income, life expectancy, log(gdp per capita) and monthly fully vaccinated rate. Particularly, the coefficient of monthly fully vaccinated rate is -0.001772 with a 0.004040 p-value by t-test, which suggests to have a significant negative association with monthly new case rate at 0.05 confidence interval.
+
+```{r include=FALSE}
+### try lmer
+random.model5 = lmer((monthly_new_case_per_100000)^0.1414141 ~ region* income+ life_expectancy + log(gdp_per_capita)+ monthly_fully_people_vaccinated_per+(1|country), data = data3)
+summary(random.model5)
+anova(random.model5)
+```
+
+
+With a 0.1499 p-value for Shapiro-Wilk normality test and qqplot, the normality is well satisfied. Also, no evidence shows that the equal variance assumption is violated(Appendix.Figure11,Appendix.Figure12).
+
+```{r eval=FALSE, include=FALSE}
+plot(random.model5)
+qqPlot(residuals(random.model5))
+shapiro.test(residuals(random.model5))
+
+```
+
+
+
+
+# Conclusion and Discussion
+
+With LASSO regression and t-test, the factors selected to be most explanatory for monthly increased case rate are income level, region, gdp per capita, life expectancy and fully vaccinated rate. In particular, higher gdp per capita and life expectancy are associated with higher case rate. With the random effect by country added in model, life expectancy becomes less significant than previously analyzed. So we can draw conclusion that the most effective factors associated with case rate are income level, region, gdp per capita and fully vaccinated rate. Also, by two-way anova model, we have found that low income is associated with the lowest case rate, while EURO is associated with the highest case rate. Additionally, we can rank the severity of covid infection across regions and income levels (see 4.5.3). For the effect of vaccination, if we only focus on the period between the first vaccine date and the abnormal increase started from October of 2021, we can find that the fully vaccinated rate is negatively associated with monthly new case rate by a mixed effect linear model.
+
+Here are some discussions for the models and conclusions. First, the significance of interaction term of region and income is not determined since contradictory conclusions are drawn from fixed and mixed effect model. Second, although for most case, the normality and equal variance assumptions are not severely violated according to the diagnostic plots, but they are not perfectly satisfied. Some other possible methods can be explored to modify this problem. Third, some factors might be associated with the case rate but get removed during the variable selection process. The reason why they are 'insignificant' is that their effects are masked by the existence of other 'decisive' factors with 'stronger' effects. The variables we finally selected are more explanatory for the case rate increasing compared to others in the variable pool. 
+
+# Reference
+[1] Latest reported counts of cases and deaths, WHO Covid-19 Dashboards. https://covid19.who.int/WHO-COVID-19-global-table-data.csv
+
+[2] Daily cases and deaths by date reported to WHO, WHO Covid-19 Dashboards. https://covid19.who.int/WHO-COVID-19-global-table-data.csv
+
+[3] https://github.com/owid/covid-19-data/blob/master/public/data/owid-covid-data.csv
+
+[4] World Bank Country and Lending Groups. https://datahelpdesk.worldbank.org/knowledgebase/articles/906519-world-bank-country-and-lending-groups
+
+[5] Li M, Zhang Z, Cao W, et al. Identifying novel factors associated with COVID-19 transmission and fatality using the machine learning approach. Sci Total Environ. 2021;764:142810. doi:10.1016/j.scitotenv.2020.142810
+
+[6] Bozio CH, Grannis SJ, Naleway AL, et al. Laboratory-Confirmed COVID-19 Among Adults Hospitalized with COVID-19–Like Illness with Infection-Induced or mRNA Vaccine-Induced SARS-CoV-2 Immunity — Nine States, January–September 2021. MMWR Morb Mortal Wkly Rep 2021;70:1539–1544. DOI: http://dx.doi.org/10.15585/mmwr.mm7044e1
+
+[7] Georges Monette, Mixed Models with R:Longitudinal Data Analysis with Mixed Models, SPIDA 2012-Part 3, May 2012, course note.http://blackwell.math.yorku.ca/MATH6635/2016/Day16/Hierarchical_and_Longitudinal_Models.pdf  
+
+
+
+
+
+
+# Appedix
+```{r echo=FALSE, fig.align="center", fig.height=3.7, fig.width=5, message=FALSE, warning=FALSE}
+ggplot(fit_pre, aes(fitted.values(fit_pre), resid(fit_pre))) + 
+  geom_hline(yintercept=0,linetype="dashed") +
+  geom_point()+
+  geom_smooth()+
+  labs(x="fitted",y="residual",title = "Figure1: residual vs fitted")+
+  theme(plot.title = element_text(hjust = 0.5))
+plot(fit_pre,2,title(main ="Figure2: qqPlot"))
+
+ggplot(fit2, aes(fitted.values(fit2), resid(fit2))) + 
+  geom_hline(yintercept=0,linetype="dashed") +
+  geom_point()+
+  geom_smooth()+
+  labs(x="fitted",y="residual",title = "Figure3: residual vs fitted")+
+  theme(plot.title = element_text(hjust = 0.5))
+qqPlot(fit2,main = "Figure4: QQplot of residuals",id = FALSE)
+
+plot(random.model2_2,main = "Figure5: residual vs fitted")
+qqPlot(residuals(random.model2_2),main = "Figure6: QQplot of residuals",id = FALSE)
+
+qqPlot(anova.fit1,main = "Figure7: QQplot of residuals",id = FALSE)
+ggplot(anova.fit1, aes(fitted.values(anova.fit1), resid(anova.fit1))) + 
+  geom_hline(yintercept=0,linetype="dashed") +
+  geom_point()+
+  geom_smooth()+
+  labs(x="fitted",y="residual",title = "Figure8: residual vs fitted")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggplot(fit_before_omi, aes(fitted.values(fit_before_omi), resid(fit_before_omi))) + 
+  geom_hline(yintercept=0,linetype="dashed") +
+  geom_point()+
+  geom_smooth()+
+  labs(x="fitted",y="residual",title = "Figure9: residual vs fitted")+
+  theme(plot.title = element_text(hjust = 0.5))
+
+qqPlot(fit_before_omi,main = "Figure 10: QQplot of residuals",id = FALSE)
+
+plot(random.model5,main="Figure11: residual vs fitted")
+qqPlot(residuals(random.model5),main = "Figure 12: QQplot of residuals",id = FALSE)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+x = data.frame(variable =c("(Intercept)","regionAMRO","regionEMRO","regionEURO","regionSEARO","regionWPRO","population_density","median_age","aged_65_older","aged_70_older","gdp_per_capita","cardiovasc_death_rate","handwashing_facilities","hospital_beds_per_thousand","life_expectancy","monthly_fully_people_vaccinated_per","incomelow","incomelower middle","incomeupper middle"),s0 = c(8.143628e-01,1.132889e-01,".", 1.315554e-01,-6.347392e-02,-1.180684e-01,".", 3.606652e-05, ".",".",6.102748e-02,".",".",".",2.529186e-05,5.313747e-03,-9.988505e-02,".",6.195142e-02))
+                  
+knitr::kable(as.data.frame(x),caption = "Table 1")
+```
